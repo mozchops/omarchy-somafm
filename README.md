@@ -30,7 +30,8 @@ when needed to stay within the screen edges. Right-click a station to toggle
 its favorite status. Favorites appear first; the sort button switches between
 alphabetical and most-played order, based on accumulated listening time.
 Listening totals accumulate across playback sessions and are saved with the
-station cache; **Reset listening times** clears those totals.
+station cache; the alphabetical/most-played sort choice is saved there too.
+**Reset listening times** clears those totals.
 The selector is 50% taller than its original layout and accepts typed
 station-name prefixes, scrolling the matching station into view. Its validated
 station catalog and favorite station records are saved in

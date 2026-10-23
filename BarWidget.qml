@@ -78,6 +78,7 @@ BarWidget {
   function toggleFavoriteSort() {
     persisted.favoriteSort = persisted.favoriteSort === "time" ? "name" : "time"
     rebuildStationRows()
+    saveStationConfig()
   }
 
   function resetListeningTimes() {
@@ -227,6 +228,8 @@ BarWidget {
         }
       }
       persisted.playTimes = loadedPlayTimes
+      if (config.favoriteSort === "name" || config.favoriteSort === "time")
+        persisted.favoriteSort = config.favoriteSort
       refreshSavedFavorites()
       rebuildStationRows()
       saveStationConfig()
@@ -241,6 +244,7 @@ BarWidget {
       version: 1,
       stations: stations,
       favorites: savedFavoriteStations,
+      favoriteSort: persisted.favoriteSort,
       playTimes: persisted.playTimes || ({})
     }, null, 2) + "\n")
   }
