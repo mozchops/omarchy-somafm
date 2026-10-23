@@ -5,7 +5,7 @@
 Install from the Git repository with:
 
 ```bash
-omarchy plugin add https://github.com/OWNER/omarchy-somafm.git --enable
+omarchy plugin add https://github.com/mozchops/omarchy-somafm.git --enable
 ```
 The widget will appear in the bar; playback starts when you select a
 station. To remove it from the bar temporarily, run
