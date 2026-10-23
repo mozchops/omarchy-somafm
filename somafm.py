@@ -296,6 +296,20 @@ def spectrum(pcm: bytes) -> list[float]:
     return bands
 
 
+def apply_volume(pcm: bytes, volume: float) -> bytes:
+    if volume >= 1:
+        return pcm
+    samples = array.array("h")
+    samples.frombytes(pcm)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    for index, sample in enumerate(samples):
+        samples[index] = int(sample * volume)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return samples.tobytes()
+
+
 def stop_children(*children: subprocess.Popen[bytes] | None) -> None:
     for child in children:
         if child and child.poll() is None:
@@ -358,6 +372,8 @@ def play_stream(url: str, channel_id: str) -> int:
         input_buffer = ""
         paused = False
         visualizer_enabled = True
+        volume = 1.0
+        volume_remainder = b""
         last_output = time.monotonic()
         last_peak = 0.0
         pending_pcm = bytearray()
@@ -391,12 +407,23 @@ def play_stream(url: str, channel_id: str) -> int:
                             visualizer_enabled = command.get("enabled") is True
                             if not visualizer_enabled:
                                 emit({"type": "peak", "bands": [0] * 12})
+                        elif action == "volume":
+                            value = command.get("volume")
+                            if isinstance(value, (int, float)) and math.isfinite(value):
+                                volume = max(0.0, min(1.0, float(value)))
                 elif key.data == "audio" and not paused:
                     chunk = os.read(ffmpeg.stdout.fileno(), 4096)
                     if not chunk:
                         emit({"type": "error", "message": "Audio stream ended"})
                         STOP = True
                         break
+                    chunk = volume_remainder + chunk
+                    if len(chunk) % 2:
+                        volume_remainder = chunk[-1:]
+                        chunk = chunk[:-1]
+                    else:
+                        volume_remainder = b""
+                    chunk = apply_volume(chunk, volume)
                     output.stdin.write(chunk)
                     pending_pcm.extend(chunk)
                     last_output = time.monotonic()

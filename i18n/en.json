@@ -17,6 +17,7 @@
   "popup.empty": "No verified streams are available right now.",
   "popup.partial": "Some streams could not be checked and were omitted.",
   "popup.bitrate": "%1 kbps",
+  "popup.streamVolume": "SomaFM volume",
   "popup.visualizer": "Peak visualizer",
   "popup.playing": "Playing · right-click to pause",
   "popup.starting": "Connecting to stream…",

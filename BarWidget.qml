@@ -81,6 +81,13 @@ BarWidget {
     saveStationConfig()
   }
 
+  function setPlaybackVolume(position, width) {
+    if (width <= 0) return
+    var volume = Math.max(0, Math.min(1, Math.round(position / width * 100) / 100))
+    if (persisted.playbackVolume !== volume)
+      persisted.playbackVolume = volume
+  }
+
   function resetListeningTimes() {
     recordPlayTime()
     persisted.playTimes = ({})
@@ -287,9 +294,11 @@ BarWidget {
     property var favoriteIds: []
     property var playTimes: ({})
     property string favoriteSort: "name"
+    property real playbackVolume: 1.0
 
     onFavoriteIdsChanged: root.rebuildStationRows()
     onPlayTimesChanged: root.rebuildStationRows()
+    onPlaybackVolumeChanged: root.sendPlayerCommand("volume", playbackVolume)
   }
 
   implicitWidth: contentRow.implicitWidth + Style.space(14)
@@ -371,7 +380,8 @@ BarWidget {
   function sendPlayerCommand(action, extra) {
     if (!playerProcess.running) return
     var message = { action: action }
-    if (extra !== undefined) message.enabled = extra
+    if (action === "visualizer") message.enabled = extra
+    else if (action === "volume") message.volume = extra
     playerProcess.write(JSON.stringify(message) + "\n")
   }
 
@@ -586,7 +596,10 @@ BarWidget {
       onRead: function(line) { root.handlePlayerLine(line) }
     }
     stderr: StdioCollector { waitForEnd: true }
-    onStarted: root.sendPlayerCommand("visualizer", persisted.visualizerEnabled)
+    onStarted: {
+      root.sendPlayerCommand("volume", persisted.playbackVolume)
+      root.sendPlayerCommand("visualizer", persisted.visualizerEnabled)
+    }
     onExited: {
       if (root.pendingStation) root.launchPendingStation()
       else if (root.playbackState !== "stopped") {
@@ -727,6 +740,77 @@ BarWidget {
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
             elide: Text.ElideRight
+          }
+        }
+      }
+
+      Column {
+        width: parent.width
+        spacing: Style.space(4)
+
+        Row {
+          width: parent.width
+
+          Text {
+            textFormat: Text.PlainText
+            text: strings.t("popup.streamVolume")
+            color: root.bar.foreground
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            width: parent.width - volumeValue.implicitWidth
+          }
+
+          Text {
+            id: volumeValue
+            textFormat: Text.PlainText
+            text: Math.round(persisted.playbackVolume * 100) + "%"
+            color: root.bar.foreground
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            horizontalAlignment: Text.AlignRight
+          }
+        }
+
+        Rectangle {
+          id: volumeTrack
+          width: parent.width
+          height: Style.space(20)
+          color: "transparent"
+
+          Rectangle {
+            anchors.verticalCenter: parent.verticalCenter
+            width: parent.width
+            height: Style.space(6)
+            radius: height / 2
+            color: Qt.alpha(root.bar.foreground, 0.18)
+          }
+
+          Rectangle {
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            width: parent.width * persisted.playbackVolume
+            height: Style.space(6)
+            radius: height / 2
+            color: Commons.Color.accent
+          }
+
+          Rectangle {
+            x: Math.max(0, Math.min(parent.width - width,
+              parent.width * persisted.playbackVolume - width / 2))
+            anchors.verticalCenter: parent.verticalCenter
+            width: Style.space(14)
+            height: width
+            radius: width / 2
+            color: root.bar.foreground
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onPressed: function(mouse) { root.setPlaybackVolume(mouse.x, width) }
+            onPositionChanged: function(mouse) {
+              if (pressed) root.setPlaybackVolume(mouse.x, width)
+            }
           }
         }
       }

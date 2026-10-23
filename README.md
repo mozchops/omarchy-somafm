@@ -25,9 +25,11 @@ loaded; after that, click the button whenever you want to recheck it. The
 widget checks each highest-quality playlist and uses the available stream
 with the greatest reported bitrate. Select a station to play it; right-click
 the bar widget to pause or resume. The popup contains the peak-visualizer
-toggle and three color palettes, and opens below the bar widget, sliding left
-when needed to stay within the screen edges. Right-click a station to toggle
-its favorite status. Favorites appear first; the sort button switches between
+toggle, three color palettes, and an independent SomaFM stream-volume slider.
+The slider affects only this widget's audio, not system volume. The popup
+opens below the bar widget, sliding left when needed to stay within the screen
+edges. Right-click a station to toggle its favorite status. Favorites appear
+first; the sort button switches between
 alphabetical and most-played order, based on accumulated listening time.
 Listening totals accumulate across playback sessions and are saved with the
 station cache; the alphabetical/most-played sort choice is saved there too.
@@ -49,5 +51,5 @@ station's current-song JSON every 20 seconds. It does not refresh the catalog
 in the background.
 
 Network requests use fixed HTTPS SomaFM endpoints with bounded response sizes
-and timeouts. Unverified playlist entries are omitted. Visualizer and palette
-preferences are kept in Quickshell persistent properties.
+and timeouts. Unverified playlist entries are omitted. Visualizer, palette,
+and stream-volume preferences are kept in Quickshell persistent properties.
