@@ -5,7 +5,7 @@
   "popup.title": "SomaFM stations",
   "popup.validateSubtitle": "Type to jump to a station, or validate streams to refresh the list.",
   "popup.validateStreams": "Validate streams",
-  "popup.sortFavourites": "Sort favourites: %1",
+  "popup.sortFavourites": "Sort: %1",
   "popup.resetListeningTimes": "Reset listening times",
   "popup.sortName": "A–Z",
   "popup.sortTime": "Most played",
