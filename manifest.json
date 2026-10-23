@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "nick.somafm",
+  "name": "SomaFM",
+  "version": "1.0.0",
+  "author": "Nick",
+  "description": "SomaFM radio widget with live station metadata",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "SomaFM",
+    "description": "SomaFM streams and now-playing information",
+    "category": "Media",
+    "allowMultiple": false
+  }
+}
