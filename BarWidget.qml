@@ -24,6 +24,7 @@ BarWidget {
   property string stationSearch: ""
   property bool stationConfigLoaded: false
   property var savedFavoriteStations: []
+  property var translationStrings: ({})
   property var peakBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
   property var palettes: ({
     "Spectrum": ["#ff5f6d", "#ff8a5b", "#ffc857", "#e6f14a", "#8de969", "#48d597", "#28c5c9", "#42a5f5", "#7d83ff", "#ae72ef", "#e06bd7", "#ff6f91"],
@@ -45,9 +46,31 @@ BarWidget {
   readonly property string stationConfigPath: Quickshell.env("HOME")
     + "/.config/omarchy/somafm-stations.json"
 
-  Commons.Translations {
+  QtObject {
     id: strings
-    directory: Qt.resolvedUrl("i18n")
+
+    function t(key) {
+      var value = root.translationStrings[key]
+      return typeof value === "string" ? value : key
+    }
+  }
+
+  FileView {
+    id: translationFile
+    path: Quickshell.env("HOME") + "/.config/omarchy/plugins/nick.somafm/i18n/en.json"
+    onLoaded: {
+      try {
+        var loaded = JSON.parse(text())
+        if (!loaded || typeof loaded !== "object" || Array.isArray(loaded))
+          throw new Error("invalid translation file")
+        root.translationStrings = loaded
+      } catch (error) {
+        console.warn("nick.somafm: could not load translations: " + error)
+      }
+    }
+    onLoadFailed: function(error) {
+      console.warn("nick.somafm: could not load translations: " + error)
+    }
   }
 
   FileView {
