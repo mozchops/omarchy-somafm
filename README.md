@@ -38,8 +38,8 @@ station catalog and favorite station records are saved in
 and **Validate streams**
 refreshes it. Favorite IDs are retained across refreshes, with matching
 favorites updated to the newest stream details.
-Each station uses its official SomaFM artwork thumbnail in the selector and
-beside the currently playing station in the bar.
+Each station uses its official SomaFM artwork thumbnail in the selector; the
+bar displays the station name without artwork.
 
 The widget requires Python 3, FFmpeg, and `pw-play` (PipeWire). FFmpeg decodes
 the selected stream to PCM for PipeWire playback and calculates the live

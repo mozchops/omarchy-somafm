@@ -40,8 +40,6 @@ BarWidget {
     : ""
   readonly property bool isPlaying: playbackState === "playing"
   readonly property bool visualizerActive: persisted.visualizerEnabled && isPlaying
-  readonly property real stationThumbnailSize: currentStation && currentStation.image
-    ? Style.space(24) : 0
   readonly property string helperPath: Quickshell.env("HOME")
     + "/.config/omarchy/plugins/nick.somafm/somafm.py"
   readonly property string stationConfigPath: Quickshell.env("HOME")
@@ -443,8 +441,7 @@ BarWidget {
     spacing: Style.space(6)
     property real stationWidth: Math.min(stationText.implicitWidth, Style.space(100))
     property real trackAvailableWidth: Math.max(
-      0, Style.space(360) - stationWidth - root.stationThumbnailSize
-        - (root.stationThumbnailSize > 0 ? Style.space(6) : 0)
+      0, Style.space(360) - stationWidth
         - (visualizer.visible ? visualizer.implicitWidth : 0) - Style.space(18)
     )
     property real trackWidth: Math.min(trackText.implicitWidth, trackAvailableWidth)
@@ -459,8 +456,8 @@ BarWidget {
     }
 
     Item {
-      width: root.stationThumbnailSize + (root.stationThumbnailSize > 0 ? Style.space(6) : 0)
-        + contentRow.stationWidth + (root.trackLabel ? Style.space(6) + contentRow.trackWidth : 0)
+      width: contentRow.stationWidth
+        + (root.trackLabel ? Style.space(6) + contentRow.trackWidth : 0)
       height: root.barSize
       clip: true
       anchors.verticalCenter: parent.verticalCenter
@@ -471,19 +468,6 @@ BarWidget {
         anchors.left: parent.left
         anchors.verticalCenter: parent.verticalCenter
         spacing: Style.space(6)
-
-        Image {
-          source: root.currentStation ? root.currentStation.image : ""
-          visible: root.stationThumbnailSize > 0
-          width: root.stationThumbnailSize
-          height: root.stationThumbnailSize
-          sourceSize.width: 120
-          sourceSize.height: 120
-          fillMode: Image.PreserveAspectCrop
-          asynchronous: true
-          smooth: true
-          anchors.verticalCenter: parent.verticalCenter
-        }
 
         Text {
           id: stationText
