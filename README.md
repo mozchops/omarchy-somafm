@@ -1,5 +1,9 @@
 # SomaFM widget
 
+[SomaFM](https://somafm.com/) offers a free streaming radio service. If you enjoy
+listening, please consider [supporting SomaFM](https://somafm.com/support/) to help
+keep it running.
+
 ## Install
 
 Install from the Git repository with:
