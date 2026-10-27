@@ -175,7 +175,6 @@ def fetch_channel(channel: dict[str, object]) -> dict[str, object] | None:
             bitrate = reported_bitrate or path_bitrate
             if available and 1 <= bitrate <= 1000:
                 verified.append((bitrate, stream_url))
-                break
 
     if not verified:
         return None
@@ -188,6 +187,7 @@ def fetch_channel(channel: dict[str, object]) -> dict[str, object] | None:
         "image": valid_thumbnail_url(channel.get("image")),
         "bitrate": bitrate,
         "url": stream_url,
+        "streams": [url for _, url in sorted(verified, reverse=True)][:12],
     }
 
 
@@ -328,11 +328,27 @@ def handle_signal(_signum: int, _frame: object) -> None:
     STOP = True
 
 
-def play_stream(url: str, channel_id: str) -> int:
+def stream_candidates(url: str, channel_id: str, alternatives: object) -> list[str]:
+    if not CHANNEL_ID.fullmatch(channel_id) or not valid_stream_url(url, channel_id):
+        raise ValueError("Invalid SomaFM stream")
+    if not isinstance(alternatives, list) or len(alternatives) > 12:
+        raise ValueError("Invalid fallback streams")
+    candidates = [url]
+    for candidate in alternatives:
+        if not isinstance(candidate, str) or not valid_stream_url(candidate, channel_id):
+            raise ValueError("Invalid fallback stream")
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def play_stream(url: str, channel_id: str, alternatives: object = None) -> int:
     global STOP
     STOP = False
-    if not CHANNEL_ID.fullmatch(channel_id) or not valid_stream_url(url, channel_id):
-        emit({"type": "error", "message": "Invalid SomaFM stream"})
+    try:
+        candidates = stream_candidates(url, channel_id, [] if alternatives is None else alternatives)
+    except ValueError as error:
+        emit({"type": "error", "message": str(error)})
         return 1
 
     signal.signal(signal.SIGTERM, handle_signal)
@@ -341,6 +357,7 @@ def play_stream(url: str, channel_id: str) -> int:
     output: subprocess.Popen[bytes] | None = None
     metadata_stop = threading.Event()
     metadata: threading.Thread | None = None
+    selector = selectors.DefaultSelector()
     try:
         output = subprocess.Popen(
             ["pw-play", "--raw", "--format", "s16", "--rate", str(SAMPLE_RATE), "--channels", "2", "-"],
@@ -349,38 +366,70 @@ def play_stream(url: str, channel_id: str) -> int:
             stderr=subprocess.DEVNULL,
             bufsize=0,
         )
-        ffmpeg = subprocess.Popen(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
-                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-                "-i", url, "-vn", "-f", "s16le", "-acodec", "pcm_s16le",
-                "-ac", "2", "-ar", str(SAMPLE_RATE), "pipe:1",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            bufsize=0,
-        )
-        if ffmpeg.stdout is None or output.stdin is None:
-            raise RuntimeError("audio pipes unavailable")
+        if output.stdin is None:
+            raise RuntimeError("audio output unavailable")
         metadata = threading.Thread(target=metadata_worker, args=(channel_id, metadata_stop), daemon=True)
         metadata.start()
-        emit({"type": "state", "state": "playing"})
-
-        selector = selectors.DefaultSelector()
+        emit({"type": "state", "state": "buffering"})
         selector.register(sys.stdin, selectors.EVENT_READ, "command")
-        selector.register(ffmpeg.stdout, selectors.EVENT_READ, "audio")
         input_buffer = ""
         paused = False
         visualizer_enabled = True
         volume = 1.0
         volume_remainder = b""
-        last_output = time.monotonic()
+        last_audio = time.monotonic()
         last_peak = 0.0
         pending_pcm = bytearray()
+        retry_at = 0.0
+        failures = 0
+        playing_since = 0.0
+        announced_playing = False
+
+        def reconnect(reason: str) -> bool:
+            nonlocal ffmpeg, failures, retry_at, playing_since, announced_playing, volume_remainder
+            if ffmpeg and ffmpeg.stdout:
+                try:
+                    selector.unregister(ffmpeg.stdout)
+                except KeyError:
+                    pass
+                stop_children(ffmpeg)
+                ffmpeg.stdout.close()
+            ffmpeg = None
+            if playing_since and time.monotonic() - playing_since >= 30:
+                failures = 0
+            failures += 1
+            playing_since = 0.0
+            announced_playing = False
+            pending_pcm.clear()
+            volume_remainder = b""
+            if failures > 6:
+                emit({"type": "error", "message": reason})
+                return False
+            retry_at = time.monotonic() + min(2 ** (failures - 1), 8)
+            emit({"type": "state", "state": "reconnecting", "attempt": failures})
+            emit({"type": "peak", "bands": [0] * 12})
+            return True
+
         while not STOP:
-            if ffmpeg.poll() is not None or output.poll() is not None:
-                emit({"type": "error", "message": "Audio playback stopped"})
-                break
+            if output.poll() is not None:
+                raise RuntimeError("PipeWire audio output stopped")
+            if not paused and ffmpeg is None and time.monotonic() >= retry_at:
+                ffmpeg = subprocess.Popen(
+                    [
+                        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+                        "-rw_timeout", "15000000",
+                        "-i", candidates[failures % len(candidates)],
+                        "-vn", "-f", "s16le", "-acodec", "pcm_s16le",
+                        "-ac", "2", "-ar", str(SAMPLE_RATE), "pipe:1",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    bufsize=0,
+                )
+                if ffmpeg.stdout is None:
+                    raise RuntimeError("audio input unavailable")
+                selector.register(ffmpeg.stdout, selectors.EVENT_READ, "audio")
+                last_audio = time.monotonic()
             for key, _ in selector.select(timeout=0.2):
                 if key.data == "command":
                     chunk = os.read(sys.stdin.fileno(), 4096)
@@ -396,11 +445,20 @@ def play_stream(url: str, channel_id: str) -> int:
                             continue
                         action = command.get("action") if isinstance(command, dict) else ""
                         if action == "pause":
-                            paused = True
-                            emit({"type": "state", "state": "paused"})
+                            if not paused:
+                                paused = True
+                                if ffmpeg and ffmpeg.stdout:
+                                    selector.unregister(ffmpeg.stdout)
+                                emit({"type": "state", "state": "paused"})
                         elif action == "resume":
-                            paused = False
-                            emit({"type": "state", "state": "playing"})
+                            if paused:
+                                paused = False
+                                announced_playing = False
+                                playing_since = 0.0
+                                last_audio = time.monotonic()
+                                if ffmpeg and ffmpeg.stdout:
+                                    selector.register(ffmpeg.stdout, selectors.EVENT_READ, "audio")
+                                emit({"type": "state", "state": "buffering" if ffmpeg else "reconnecting"})
                         elif action == "stop":
                             STOP = True
                         elif action == "visualizer":
@@ -411,11 +469,11 @@ def play_stream(url: str, channel_id: str) -> int:
                             value = command.get("volume")
                             if isinstance(value, (int, float)) and math.isfinite(value):
                                 volume = max(0.0, min(1.0, float(value)))
-                elif key.data == "audio" and not paused:
+                elif key.data == "audio" and not paused and not STOP and ffmpeg:
                     chunk = os.read(ffmpeg.stdout.fileno(), 4096)
                     if not chunk:
-                        emit({"type": "error", "message": "Audio stream ended"})
-                        STOP = True
+                        if not reconnect("Audio stream ended after repeated reconnect attempts"):
+                            return 1
                         break
                     chunk = volume_remainder + chunk
                     if len(chunk) % 2:
@@ -424,28 +482,42 @@ def play_stream(url: str, channel_id: str) -> int:
                     else:
                         volume_remainder = b""
                     chunk = apply_volume(chunk, volume)
-                    output.stdin.write(chunk)
+                    remaining = memoryview(chunk)
+                    while remaining:
+                        written = output.stdin.write(remaining)
+                        if not written:
+                            raise RuntimeError("PipeWire audio output closed")
+                        remaining = remaining[written:]
+                    if chunk and not announced_playing:
+                        announced_playing = True
+                        playing_since = time.monotonic()
+                        emit({"type": "state", "state": "playing"})
                     pending_pcm.extend(chunk)
-                    last_output = time.monotonic()
+                    last_audio = time.monotonic()
                     if len(pending_pcm) >= FFT_SIZE * 4:
                         block = bytes(pending_pcm[:FFT_SIZE * 4])
                         del pending_pcm[:FFT_SIZE * 4]
                         if visualizer_enabled and time.monotonic() - last_peak >= 0.08:
                             emit({"type": "peak", "bands": spectrum(block)})
                             last_peak = time.monotonic()
-            if not paused and time.monotonic() - last_output > 35:
-                emit({"type": "error", "message": "Audio stream timed out"})
-                break
-        selector.close()
+            if not paused and ffmpeg and time.monotonic() - last_audio > 20:
+                if not reconnect("Audio stream timed out after repeated reconnect attempts"):
+                    return 1
+        emit({"type": "state", "state": "stopped"})
         return 0
     except (OSError, subprocess.SubprocessError, RuntimeError) as error:
         emit({"type": "error", "message": clean_text(str(error), 180) or "Audio playback could not start"})
         return 1
     finally:
+        selector.close()
         metadata_stop.set()
         if metadata:
             metadata.join(timeout=1)
         stop_children(ffmpeg, output)
+        if ffmpeg and ffmpeg.stdout:
+            ffmpeg.stdout.close()
+        if output and output.stdin:
+            output.stdin.close()
 
 
 def main() -> int:
@@ -456,8 +528,13 @@ def main() -> int:
         except (OSError, URLError, ValueError, json.JSONDecodeError) as error:
             emit({"error": clean_text(str(error), 180) or "Could not load SomaFM catalog"})
             return 1
-    if len(sys.argv) == 4 and sys.argv[1] == "play":
-        return play_stream(sys.argv[2], sys.argv[3])
+    if len(sys.argv) in (4, 5) and sys.argv[1] == "play":
+        try:
+            alternatives = json.loads(sys.argv[4]) if len(sys.argv) == 5 else []
+        except json.JSONDecodeError:
+            emit({"type": "error", "message": "Invalid fallback streams"})
+            return 1
+        return play_stream(sys.argv[2], sys.argv[3], alternatives)
     emit({"error": "Unsupported helper mode"})
     return 2
 

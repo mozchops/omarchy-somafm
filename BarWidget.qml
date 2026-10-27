@@ -13,6 +13,14 @@ BarWidget {
   property bool loadingStations: false
   property string catalogError: ""
   property string catalogWarning: ""
+  property string playbackError: ""
+  property string mediaError: ""
+  property bool mediaReady: false
+  property string copyFeedback: ""
+  property var recentTracks: []
+  property bool showHistory: false
+  property double sleepDeadline: 0
+  property int sleepMinutes: 0
   property var stations: []
   property var currentStation: null
   property string trackTitle: ""
@@ -41,6 +49,20 @@ BarWidget {
     : ""
   readonly property bool isPlaying: playbackState === "playing"
   readonly property bool visualizerActive: persisted.visualizerEnabled && isPlaying
+  readonly property string statusLabel: {
+    if (playbackState === "failed") return strings.t("popup.failed")
+    if (playbackState === "buffering") return strings.t("popup.buffering")
+    if (playbackState === "reconnecting") return strings.t("popup.reconnecting")
+    if (playbackState === "paused") return strings.t("popup.paused")
+    if (playbackState === "playing") return strings.t("popup.playing")
+    return strings.t(currentStation ? "popup.stopped" : "popup.idle")
+  }
+  readonly property string sleepLabel: {
+    var tick = listeningClockTick
+    return sleepDeadline > 0
+      ? strings.t("popup.sleepRemaining").arg(Math.max(0, Math.ceil((sleepDeadline - Date.now()) / 60000)))
+      : strings.t("popup.sleepOff")
+  }
   readonly property string helperPath: Quickshell.env("HOME")
     + "/.config/omarchy/plugins/nick.somafm/somafm.py"
   readonly property string stationConfigPath: Quickshell.env("HOME")
@@ -81,7 +103,15 @@ BarWidget {
     onSaveFailed: root.catalogError = strings.t("popup.configError")
   }
 
-  Component.onCompleted: stationConfigFile.reload()
+  Component.onCompleted: {
+    stationConfigFile.reload()
+    mediaProcess.running = true
+  }
+
+  onCurrentStationChanged: updateMedia()
+  onTrackTitleChanged: updateMedia()
+  onTrackArtistChanged: updateMedia()
+  onPlaybackStateChanged: updateMedia()
 
   function isFavorite(stationId) {
     return persisted.favoriteIds.indexOf(stationId) >= 0
@@ -147,6 +177,9 @@ BarWidget {
     var favorites = []
     var others = []
     for (var i = 0; i < stations.length; i++) {
+      var searchable = [stations[i].title, stations[i].description, stations[i].genre].join(" ").toLowerCase()
+      var terms = stationSearch.trim().toLowerCase().split(/\s+/)
+      if (!terms.every(function(term) { return searchable.indexOf(term) >= 0 })) continue
       if (isFavorite(stations[i].id)) favorites.push(stations[i])
       else others.push(stations[i])
     }
@@ -184,11 +217,20 @@ BarWidget {
     if (!station || typeof station !== "object"
         || !/^[a-z0-9][a-z0-9-]{0,47}$/.test(station.id || "")
         || typeof station.title !== "string" || typeof station.url !== "string"
-        || !/^https:\/\/ice[0-9]+\.somafm\.com\/[a-z0-9-]+$/.test(station.url)
+        || !new RegExp("^https://ice[0-9]+\\.somafm\\.com/" + station.id + "(?:-[a-z0-9]+)+$").test(station.url)
         || !Number.isInteger(Number(station.bitrate)) || Number(station.bitrate) < 1) return null
     var image = typeof station.image === "string"
         && /^https:\/\/api\.somafm\.com\/logos\/120\/[A-Za-z0-9-]+120\.(?:png|jpe?g|gif)(?:\?v=\d{1,20})?$/.test(station.image)
       ? station.image : ""
+    var streams = [station.url]
+    if (Array.isArray(station.streams)) {
+      station.streams.slice(0, 12).forEach(function(url) {
+        if (typeof url === "string"
+            && new RegExp("^https://ice[0-9]+\\.somafm\\.com/" + station.id + "(?:-[a-z0-9]+)+$").test(url)
+            && streams.indexOf(url) < 0 && streams.length < 12)
+          streams.push(url)
+      })
+    }
     return {
       id: station.id,
       title: station.title.slice(0, 100),
@@ -196,7 +238,8 @@ BarWidget {
       genre: String(station.genre || "").slice(0, 60),
       image: image,
       bitrate: Number(station.bitrate),
-      url: station.url
+      url: station.url,
+      streams: streams
     }
   }
 
@@ -260,6 +303,20 @@ BarWidget {
       persisted.playTimes = loadedPlayTimes
       if (config.favoriteSort === "name" || config.favoriteSort === "time")
         persisted.favoriteSort = config.favoriteSort
+      if (typeof config.autoPlay === "boolean") persisted.autoPlay = config.autoPlay
+      recentTracks = Array.isArray(config.recentTracks)
+        ? config.recentTracks.slice(0, 30).filter(function(track) {
+          return track && typeof track.title === "string" && track.title.length <= 160
+            && typeof track.artist === "string" && track.artist.length <= 120
+            && typeof track.station === "string" && track.station.length <= 100
+            && typeof track.stationId === "string" && /^[a-z0-9][a-z0-9-]{0,47}$/.test(track.stationId)
+            && Number.isFinite(track.playedAt) && track.playedAt > 0
+        }) : []
+      var lastStation = normalizeStation(config.lastStation)
+      if (lastStation) {
+        currentStation = stationForId(stations, lastStation.id) || lastStation
+        if (persisted.autoPlay) startStation(currentStation)
+      }
       refreshSavedFavorites()
       rebuildStationRows()
       saveStationConfig()
@@ -275,37 +332,75 @@ BarWidget {
       stations: stations,
       favorites: savedFavoriteStations,
       favoriteSort: persisted.favoriteSort,
-      playTimes: persisted.playTimes || ({})
+      playTimes: persisted.playTimes || ({}),
+      lastStation: currentStation,
+      autoPlay: persisted.autoPlay,
+      recentTracks: recentTracks
     }, null, 2) + "\n")
   }
 
   function searchStations(query) {
     stationSearch = query.toLowerCase()
-    if (!stationSearch) return
-    for (var i = 0; i < stationRows.length; i++) {
-      var row = stationRows[i]
-      if (row.type === "station" && row.station.title.toLowerCase().indexOf(stationSearch) === 0) {
-        stationList.currentIndex = i
-        stationList.positionViewAtIndex(i, ListView.Beginning)
-        return
-      }
-    }
+    rebuildStationRows()
+    stationList.positionViewAtBeginning()
   }
 
-  function handleSearchKey(event) {
-    if (event.key === Qt.Key_Escape) {
-      popup.close()
-      event.accepted = true
-      return
-    }
-    if (event.key === Qt.Key_Backspace) {
-      searchStations(stationSearch.slice(0, -1))
-      event.accepted = true
-      return
-    }
-    if (event.text && /^[a-z0-9 -]$/i.test(event.text)) {
-      searchStations(stationSearch + event.text)
-      event.accepted = true
+  function rememberTrack() {
+    if (!currentStation || !trackTitle) return
+    var previous = recentTracks[0]
+    if (previous && previous.title === trackTitle && previous.artist === trackArtist
+        && previous.stationId === currentStation.id) return
+    recentTracks = [{
+      title: trackTitle, artist: trackArtist, station: currentStation.title,
+      stationId: currentStation.id, playedAt: Date.now()
+    }].concat(recentTracks).slice(0, 30)
+    saveStationConfig()
+  }
+
+  function copyTrack(track) {
+    if (!track || !track.title || clipboardProcess.running) return
+    copyFeedback = ""
+    clipboardProcess.command = ["wl-copy", "--", track.title + (track.artist ? " — " + track.artist : "")]
+    clipboardProcess.running = true
+  }
+
+  function cycleSleepTimer() {
+    var choices = [0, 15, 30, 60, 90]
+    sleepMinutes = choices[(choices.indexOf(sleepMinutes) + 1) % choices.length]
+    sleepDeadline = sleepMinutes > 0 ? Date.now() + sleepMinutes * 60000 : 0
+  }
+
+  function updateMedia() {
+    if (!mediaReady || !mediaProcess.running) return
+    mediaProcess.write(JSON.stringify({
+      state: playbackState,
+      station: currentStation ? currentStation.title : "",
+      image: currentStation ? currentStation.image : "",
+      title: trackTitle, artist: trackArtist, volume: persisted.playbackVolume
+    }) + "\n")
+  }
+
+  function handleMediaLine(line) {
+    try {
+      var message = JSON.parse(line)
+      if (message.type === "ready") {
+        mediaReady = true
+        mediaError = ""
+        updateMedia()
+      } else if (message.type === "error") {
+        mediaError = strings.t("popup.mediaError") + " " + String(message.message || "").slice(0, 240)
+      } else if (message.type === "command") {
+        if (message.action === "toggle") togglePlayback()
+        else if (message.action === "stop") stopPlayback()
+        else if (message.action === "open") openSelector()
+        else if (message.action === "pause") pausePlayback()
+        else if (message.action === "play") resumePlayback()
+        else if (message.action === "volume" && typeof message.volume === "number"
+                 && Number.isFinite(message.volume))
+          persisted.playbackVolume = Math.max(0, Math.min(1, message.volume))
+      }
+    } catch (error) {
+      mediaError = strings.t("popup.mediaError")
     }
   }
 
@@ -318,16 +413,24 @@ BarWidget {
     property var playTimes: ({})
     property string favoriteSort: "name"
     property real playbackVolume: 1.0
+    property bool autoPlay: false
 
     onFavoriteIdsChanged: root.rebuildStationRows()
     onPlayTimesChanged: root.rebuildStationRows()
-    onPlaybackVolumeChanged: root.sendPlayerCommand("volume", playbackVolume)
+    onPlaybackVolumeChanged: {
+      root.sendPlayerCommand("volume", playbackVolume)
+      root.updateMedia()
+    }
   }
 
   implicitWidth: contentRow.implicitWidth + Style.space(14)
   implicitHeight: barSize
 
-  onPopupOpenChanged: if (popupOpen) stationSearch = ""
+  onPopupOpenChanged: if (popupOpen) {
+    searchField.text = ""
+    searchStations("")
+    copyFeedback = ""
+  }
   onStationConfigLoadedChanged: {
     if (stationConfigLoaded && popupOpen && stations.length === 0 && !loadingStations)
       validateStreams()
@@ -363,6 +466,7 @@ BarWidget {
   function startStation(station) {
     if (!station || !station.url || !station.id) return
     recordPlayTime()
+    playbackSegmentStartedAt = 0
     pendingStation = station
     if (playerProcess.running) playerProcess.running = false
     else launchPendingStation()
@@ -376,28 +480,45 @@ BarWidget {
     pendingStation = null
     trackTitle = ""
     trackArtist = ""
-    playbackState = "starting"
+    playbackError = ""
+    playbackState = "buffering"
     playbackSegmentStartedAt = 0
     playerProcess.command = [
-      "python3", helperPath, "play", currentStation.url, currentStation.id
+      "python3", helperPath, "play", currentStation.url, currentStation.id,
+      JSON.stringify(currentStation.streams || [])
     ]
     playerProcess.running = true
+    saveStationConfig()
   }
 
   function stopPlayback() {
     recordPlayTime()
+    playbackSegmentStartedAt = 0
+    sleepDeadline = 0
+    sleepMinutes = 0
     pendingStation = null
     if (playerProcess.running) playerProcess.running = false
     playbackState = "stopped"
+    playbackError = ""
     trackTitle = ""
     trackArtist = ""
   }
 
   function togglePlayback() {
     if (!currentStation) return
-    if (playbackState === "playing") sendPlayerCommand("pause")
-    else if (playbackState === "paused") sendPlayerCommand("resume")
-    else if (playbackState === "stopped") startStation(currentStation)
+    if (["playing", "buffering", "reconnecting"].indexOf(playbackState) >= 0) pausePlayback()
+    else resumePlayback()
+  }
+
+  function pausePlayback() {
+    if (["playing", "buffering", "reconnecting"].indexOf(playbackState) >= 0)
+      sendPlayerCommand("pause")
+  }
+
+  function resumePlayback() {
+    if (playbackState === "paused") sendPlayerCommand("resume")
+    else if (currentStation && ["stopped", "failed"].indexOf(playbackState) >= 0)
+      startStation(currentStation)
   }
 
   function sendPlayerCommand(action, extra) {
@@ -439,26 +560,36 @@ BarWidget {
     try {
       var message = JSON.parse(String(line || "").trim())
       if (message.type === "state") {
+        if (["playing", "paused", "stopped", "buffering", "reconnecting"].indexOf(message.state) < 0)
+          throw new Error("invalid playback state")
         if (message.state === "playing" && playbackState !== "playing")
           playbackSegmentStartedAt = Date.now()
-        else if (message.state !== "playing" && playbackState === "playing")
+        else if (message.state !== "playing" && playbackState === "playing") {
           recordPlayTime()
+          playbackSegmentStartedAt = 0
+        }
         playbackState = message.state
+        if (isPlaying) rememberTrack()
       }
       else if (message.type === "track") {
         trackTitle = String(message.title || "").slice(0, 160)
         trackArtist = String(message.artist || "").slice(0, 120)
+        if (isPlaying) rememberTrack()
       } else if (message.type === "peak" && message.bands instanceof Array) {
         peakBands = message.bands.slice(0, 12).map(function(value) {
           return Math.max(0, Math.min(1, Number(value) || 0))
         })
       } else if (message.type === "error") {
         recordPlayTime()
-        playbackState = "stopped"
-        catalogError = strings.t("popup.audioError")
+        playbackSegmentStartedAt = 0
+        playbackState = "failed"
+        playbackError = strings.t("popup.audioError") + " " + String(message.message || "").slice(0, 180)
       }
     } catch (error) {
-      playbackState = "stopped"
+      recordPlayTime()
+      playbackSegmentStartedAt = 0
+      playbackState = "failed"
+      playbackError = strings.t("popup.audioError")
     }
   }
 
@@ -613,6 +744,28 @@ BarWidget {
   }
 
   Process {
+    id: mediaProcess
+    command: ["python3", root.helperPath.replace(/somafm\.py$/, "mpris.py")]
+    stdinEnabled: true
+    stdout: SplitParser {
+      onRead: function(line) { root.handleMediaLine(line) }
+    }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: {
+      root.mediaReady = false
+      if (!root.mediaError) root.mediaError = strings.t("popup.mediaError")
+    }
+  }
+
+  Process {
+    id: clipboardProcess
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      root.copyFeedback = strings.t(exitCode === 0 ? "popup.copied" : "popup.copyError")
+    }
+  }
+
+  Process {
     id: playerProcess
     stdinEnabled: true
     stdout: SplitParser {
@@ -625,9 +778,11 @@ BarWidget {
     }
     onExited: {
       if (root.pendingStation) root.launchPendingStation()
-      else if (root.playbackState !== "stopped") {
+      else if (["stopped", "failed"].indexOf(root.playbackState) < 0) {
         root.recordPlayTime()
-        root.playbackState = "stopped"
+        root.playbackSegmentStartedAt = 0
+        root.playbackState = "failed"
+        root.playbackError = strings.t("popup.audioError")
       }
     }
   }
@@ -642,14 +797,12 @@ BarWidget {
   Timer {
     interval: 1000
     repeat: true
-    running: root.isPlaying
-    onTriggered: root.listeningClockTick++
-  }
-
-  Timer {
-    id: searchResetTimer
-    interval: 1000
-    onTriggered: root.stationSearch = ""
+    running: root.isPlaying || root.sleepDeadline > 0
+    onTriggered: {
+      root.listeningClockTick++
+      if (root.sleepDeadline > 0 && Date.now() >= root.sleepDeadline)
+        root.stopPlayback()
+    }
   }
 
   KeyboardPanel {
@@ -658,276 +811,434 @@ BarWidget {
     bar: root.bar
     owner: root
     open: root.popupOpen
-    focusTarget: searchKeys
+    focusTarget: searchField
     centerOnBar: false
-    contentWidth: popup.fittedContentWidth(Style.space(380))
-    contentHeight: popup.fittedContentHeight(panelContent.implicitHeight)
+    contentWidth: popup.fittedContentWidth(Style.space(420))
+    contentHeight: popup.fittedContentHeight(Style.space(900))
 
-    Column {
+    Item {
       id: panelContent
       anchors.fill: parent
-      spacing: Style.space(10)
 
-      Column {
+      Flickable {
+        id: controlsViewport
         width: parent.width
-        spacing: Style.space(2)
-
-        Text {
-          textFormat: Text.PlainText
-          text: strings.t("popup.title")
-          color: root.bar.foreground
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.subtitle
-          font.bold: true
-        }
-
-        Text {
-          width: parent.width
-          textFormat: Text.PlainText
-          text: strings.t("popup.validateSubtitle")
-          color: Qt.darker(root.bar.foreground, 1.35)
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.caption
-          wrapMode: Text.WordWrap
-        }
-      }
-
-      Row {
-        width: parent.width
-        spacing: Style.space(8)
-
-        Button {
-          width: (parent.width - Style.space(8)) / 2
-          text: strings.t("popup.validateStreams")
-          foreground: root.bar.foreground
-          bordered: true
-          enabled: !root.loadingStations
-          opacity: enabled ? 1.0 : 0.55
-          onClicked: root.validateStreams()
-        }
-
-        Button {
-          width: (parent.width - Style.space(8)) / 2
-          text: strings.t("popup.sortFavourites").arg(
-            strings.t(persisted.favoriteSort === "time" ? "popup.sortTime" : "popup.sortName")
-          )
-          foreground: root.bar.foreground
-          bordered: true
-          onClicked: root.toggleFavoriteSort()
-        }
-      }
-
-      Button {
-        width: parent.width
-        text: strings.t("popup.resetListeningTimes")
-        foreground: root.bar.foreground
-        bordered: true
-        onClicked: root.resetListeningTimes()
-      }
-
-      Rectangle {
-        width: parent.width
-        height: Style.space(52)
-        radius: Style.spacing.labelGap
-        color: Qt.alpha(root.bar.foreground, 0.06)
+        height: Math.min(panelControls.implicitHeight, Math.max(0, parent.height - Style.space(130)))
+        contentWidth: width
+        contentHeight: panelControls.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
 
         Column {
-          anchors.left: parent.left
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-          anchors.leftMargin: Style.space(10)
-          anchors.rightMargin: Style.space(10)
-          spacing: Style.space(3)
+          id: panelControls
+          width: parent.width
+          spacing: Style.space(8)
 
-          Text {
+          Column {
             width: parent.width
-            textFormat: Text.PlainText
-            text: root.currentStation ? root.currentStation.title : strings.t("widget.noStation")
-            color: root.bar.foreground
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            font.bold: true
-            elide: Text.ElideRight
+            spacing: Style.space(2)
+
+            Text {
+              textFormat: Text.PlainText
+              text: strings.t("popup.title")
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.subtitle
+              font.bold: true
+            }
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: strings.t("popup.validateSubtitle")
+              color: Qt.darker(root.bar.foreground, 1.35)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+          }
+
+          Row {
+            width: parent.width
+            spacing: Style.space(8)
+
+            Button {
+              width: (parent.width - Style.space(8)) / 2
+              text: strings.t("popup.validateStreams")
+              foreground: root.bar.foreground
+              bordered: true
+              enabled: !root.loadingStations
+              opacity: enabled ? 1.0 : 0.55
+              onClicked: root.validateStreams()
+            }
+
+            Button {
+              width: (parent.width - Style.space(8)) / 2
+              text: strings.t("popup.sortFavourites").arg(
+                strings.t(persisted.favoriteSort === "time" ? "popup.sortTime" : "popup.sortName")
+              )
+              foreground: root.bar.foreground
+              bordered: true
+              onClicked: root.toggleFavoriteSort()
+            }
+          }
+
+          Button {
+            width: parent.width
+            text: strings.t("popup.resetListeningTimes")
+            foreground: root.bar.foreground
+            bordered: true
+            onClicked: root.resetListeningTimes()
+          }
+
+          Rectangle {
+            width: parent.width
+            height: Style.space(76)
+            radius: Style.spacing.labelGap
+            color: Qt.alpha(root.bar.foreground, 0.06)
+
+            Column {
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(10)
+              anchors.rightMargin: Style.space(10)
+              spacing: Style.space(3)
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.currentStation ? root.currentStation.title : strings.t("widget.noStation")
+                color: root.bar.foreground
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+                elide: Text.ElideRight
+              }
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.statusLabel
+                color: root.playbackState === "failed" ? root.bar.urgent
+                  : Qt.darker(root.bar.foreground, 1.35)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.trackLabel || strings.t("popup.unknownTrack")
+                color: Qt.darker(root.bar.foreground, 1.35)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+            }
+          }
+
+          Row {
+            width: parent.width
+            spacing: Style.space(8)
+
+            Button {
+              width: (parent.width - Style.space(16)) / 3
+              text: strings.t(["playing", "buffering", "reconnecting"].indexOf(root.playbackState) >= 0
+                ? "popup.pauseButton" : "popup.playButton")
+              foreground: root.bar.foreground
+              bordered: true
+              enabled: root.currentStation !== null
+              onClicked: root.togglePlayback()
+            }
+
+            Button {
+              width: (parent.width - Style.space(16)) / 3
+              text: strings.t("popup.stopButton")
+              foreground: root.bar.foreground
+              bordered: true
+              enabled: root.currentStation !== null
+              onClicked: root.stopPlayback()
+            }
+
+            Button {
+              width: (parent.width - Style.space(16)) / 3
+              text: strings.t("popup.copyTrack")
+              foreground: root.bar.foreground
+              bordered: true
+              enabled: root.trackTitle !== "" && !clipboardProcess.running
+              onClicked: root.copyTrack({ title: root.trackTitle, artist: root.trackArtist })
+            }
+          }
+
+          Row {
+            width: parent.width
+            spacing: Style.space(8)
+
+            Button {
+              width: (parent.width - Style.space(8)) / 2
+              text: strings.t(persisted.autoPlay ? "popup.autoPlayOn" : "popup.autoPlayOff")
+              foreground: root.bar.foreground
+              bordered: true
+              onClicked: {
+                persisted.autoPlay = !persisted.autoPlay
+                root.saveStationConfig()
+              }
+            }
+
+            Button {
+              width: (parent.width - Style.space(8)) / 2
+              text: root.sleepLabel
+              foreground: root.bar.foreground
+              bordered: true
+              onClicked: root.cycleSleepTimer()
+            }
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(4)
+
+            Row {
+              width: parent.width
+
+              Text {
+                textFormat: Text.PlainText
+                text: strings.t("popup.streamVolume")
+                color: root.bar.foreground
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                width: parent.width - volumeValue.implicitWidth
+              }
+
+              Text {
+                id: volumeValue
+                textFormat: Text.PlainText
+                text: Math.round(persisted.playbackVolume * 100) + "%"
+                color: root.bar.foreground
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                horizontalAlignment: Text.AlignRight
+              }
+            }
+
+            Rectangle {
+              id: volumeTrack
+              width: parent.width
+              height: Style.space(20)
+              color: "transparent"
+
+              Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                width: parent.width
+                height: Style.space(6)
+                radius: height / 2
+                color: Qt.alpha(root.bar.foreground, 0.18)
+              }
+
+              Rectangle {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                width: parent.width * persisted.playbackVolume
+                height: Style.space(6)
+                radius: height / 2
+                color: Commons.Color.accent
+              }
+
+              Rectangle {
+                x: Math.max(0, Math.min(parent.width - width,
+                  parent.width * persisted.playbackVolume - width / 2))
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(14)
+                height: width
+                radius: width / 2
+                color: root.bar.foreground
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onPressed: function(mouse) { root.setPlaybackVolume(mouse.x, width) }
+                onPositionChanged: function(mouse) {
+                  if (pressed) root.setPlaybackVolume(mouse.x, width)
+                }
+              }
+            }
+          }
+
+          Row {
+            id: visualizerSettings
+            width: parent.width
+            spacing: Style.space(8)
+
+            Text {
+              id: visualizerLabel
+              textFormat: Text.PlainText
+              text: strings.t("popup.visualizer")
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              anchors.verticalCenter: parent.verticalCenter
+              width: parent.width - visualizerToggle.width - Style.space(8)
+            }
+
+            Rectangle {
+              id: visualizerToggle
+              width: Style.space(42)
+              height: Style.space(24)
+              radius: Style.space(12)
+              color: persisted.visualizerEnabled ? Commons.Color.accent : Qt.alpha(root.bar.foreground, 0.15)
+              anchors.verticalCenter: parent.verticalCenter
+
+              Rectangle {
+                width: Style.space(18)
+                height: Style.space(18)
+                radius: width / 2
+                y: Style.space(3)
+                x: persisted.visualizerEnabled ? parent.width - width - Style.space(3) : Style.space(3)
+                color: root.bar.background
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  persisted.visualizerEnabled = !persisted.visualizerEnabled
+                  root.sendPlayerCommand("visualizer", persisted.visualizerEnabled)
+                }
+              }
+            }
+
+          }
+
+          Rectangle {
+            width: parent.width
+            height: Style.space(1)
+            color: Qt.alpha(root.bar.foreground, 0.12)
           }
 
           Text {
-            width: parent.width
+            visible: root.loadingStations
             textFormat: Text.PlainText
-            text: root.trackTitle
-              ? root.trackTitle + (root.trackArtist ? " — " + root.trackArtist : "")
-              : (root.playbackState === "starting" ? strings.t("popup.starting")
-                : (root.playbackState === "playing" ? strings.t("popup.unknownTrack")
-                  : (root.playbackState === "paused" ? strings.t("popup.paused")
-                    : (root.currentStation ? strings.t("popup.stopped") : strings.t("popup.idle")))))
-            color: Qt.darker(root.bar.foreground, 1.35)
+            text: strings.t("popup.loading")
+            color: Qt.darker(root.bar.foreground, 1.3)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Text {
+            visible: root.catalogWarning !== ""
+            textFormat: Text.PlainText
+            text: root.catalogWarning
+            color: Qt.darker(root.bar.foreground, 1.3)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
-          }
-        }
-      }
-
-      Column {
-        width: parent.width
-        spacing: Style.space(4)
-
-        Row {
-          width: parent.width
-
-          Text {
-            textFormat: Text.PlainText
-            text: strings.t("popup.streamVolume")
-            color: root.bar.foreground
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            width: parent.width - volumeValue.implicitWidth
-          }
-
-          Text {
-            id: volumeValue
-            textFormat: Text.PlainText
-            text: Math.round(persisted.playbackVolume * 100) + "%"
-            color: root.bar.foreground
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            horizontalAlignment: Text.AlignRight
-          }
-        }
-
-        Rectangle {
-          id: volumeTrack
-          width: parent.width
-          height: Style.space(20)
-          color: "transparent"
-
-          Rectangle {
-            anchors.verticalCenter: parent.verticalCenter
+            wrapMode: Text.WordWrap
             width: parent.width
-            height: Style.space(6)
-            radius: height / 2
-            color: Qt.alpha(root.bar.foreground, 0.18)
+          }
+
+          Text {
+            visible: root.catalogError !== ""
+            textFormat: Text.PlainText
+            text: root.catalogError
+            color: root.bar.urgent
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+            width: parent.width
+          }
+
+          Text {
+            width: parent.width
+            visible: text !== ""
+            textFormat: Text.PlainText
+            text: [root.playbackError, root.mediaError, root.copyFeedback].filter(function(value) {
+              return value !== ""
+            }).join("\n")
+            color: root.bar.urgent
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          Row {
+            width: parent.width
+            spacing: Style.space(8)
+
+            Button {
+              width: (parent.width - Style.space(8)) / 2
+              text: strings.t("popup.stationsTab")
+              foreground: root.bar.foreground
+              bordered: true
+              enabled: root.showHistory
+              onClicked: {
+                root.showHistory = false
+                searchField.forceActiveFocus()
+              }
+            }
+
+            Button {
+              width: (parent.width - Style.space(8)) / 2
+              text: strings.t("popup.historyTab").arg(root.recentTracks.length)
+              foreground: root.bar.foreground
+              bordered: true
+              enabled: !root.showHistory
+              onClicked: root.showHistory = true
+            }
           }
 
           Rectangle {
-            anchors.left: parent.left
-            anchors.verticalCenter: parent.verticalCenter
-            width: parent.width * persisted.playbackVolume
-            height: Style.space(6)
-            radius: height / 2
-            color: Commons.Color.accent
-          }
+            width: parent.width
+            height: Style.space(32)
+            visible: !root.showHistory
+            color: Qt.alpha(root.bar.foreground, 0.06)
+            radius: Style.spacing.labelGap
 
-          Rectangle {
-            x: Math.max(0, Math.min(parent.width - width,
-              parent.width * persisted.playbackVolume - width / 2))
-            anchors.verticalCenter: parent.verticalCenter
-            width: Style.space(14)
-            height: width
-            radius: width / 2
-            color: root.bar.foreground
-          }
+            TextInput {
+              id: searchField
+              anchors.fill: parent
+              anchors.margins: Style.space(6)
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              selectByMouse: true
+              clip: true
+              onTextChanged: root.searchStations(text)
+              Keys.onEscapePressed: root.close()
+              Keys.onReturnPressed: {
+                for (var i = 0; i < root.stationRows.length; i++) {
+                  if (root.stationRows[i].type === "station") {
+                    root.startStation(root.stationRows[i].station)
+                    root.close()
+                    break
+                  }
+                }
+              }
 
-          MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            onPressed: function(mouse) { root.setPlaybackVolume(mouse.x, width) }
-            onPositionChanged: function(mouse) {
-              if (pressed) root.setPlaybackVolume(mouse.x, width)
+              Text {
+                anchors.fill: parent
+                visible: !searchField.text
+                textFormat: Text.PlainText
+                text: strings.t("popup.search")
+                color: Qt.darker(root.bar.foreground, 1.5)
+                font: searchField.font
+                elide: Text.ElideRight
+              }
             }
           }
         }
-      }
-
-      Row {
-        id: visualizerSettings
-        width: parent.width
-        spacing: Style.space(8)
-
-        Text {
-          id: visualizerLabel
-          textFormat: Text.PlainText
-          text: strings.t("popup.visualizer")
-          color: root.bar.foreground
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.bodySmall
-          anchors.verticalCenter: parent.verticalCenter
-          width: parent.width - visualizerToggle.width - Style.space(8)
-        }
-
-        Rectangle {
-          id: visualizerToggle
-          width: Style.space(42)
-          height: Style.space(24)
-          radius: Style.space(12)
-          color: persisted.visualizerEnabled ? Commons.Color.accent : Qt.alpha(root.bar.foreground, 0.15)
-          anchors.verticalCenter: parent.verticalCenter
-
-          Rectangle {
-            width: Style.space(18)
-            height: Style.space(18)
-            radius: width / 2
-            y: Style.space(3)
-            x: persisted.visualizerEnabled ? parent.width - width - Style.space(3) : Style.space(3)
-            color: root.bar.background
-          }
-
-          MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            onClicked: {
-              persisted.visualizerEnabled = !persisted.visualizerEnabled
-              root.sendPlayerCommand("visualizer", persisted.visualizerEnabled)
-            }
-          }
-        }
-
-      }
-
-      Rectangle {
-        width: parent.width
-        height: Style.space(1)
-        color: Qt.alpha(root.bar.foreground, 0.12)
-      }
-
-      Text {
-        visible: root.loadingStations
-        textFormat: Text.PlainText
-        text: strings.t("popup.loading")
-        color: Qt.darker(root.bar.foreground, 1.3)
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.bodySmall
-      }
-
-      Text {
-        visible: root.catalogWarning !== ""
-        textFormat: Text.PlainText
-        text: root.catalogWarning
-        color: Qt.darker(root.bar.foreground, 1.3)
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.caption
-        wrapMode: Text.WordWrap
-        width: parent.width
-      }
-
-      Text {
-        visible: root.catalogError !== ""
-        textFormat: Text.PlainText
-        text: root.catalogError
-        color: root.bar.urgent
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.bodySmall
-        wrapMode: Text.WordWrap
-        width: parent.width
       }
 
       ListView {
         id: stationList
         width: parent.width
-        height: count > 0 ? Style.space(450) : 0
+        y: controlsViewport.height + Style.space(8)
+        height: Math.max(0, parent.height - y)
         clip: true
         spacing: Style.space(3)
         model: root.stationRows
-        visible: count > 0
+        visible: !root.showHistory && count > 0
         boundsBehavior: Flickable.StopAtBounds
 
         delegate: Rectangle {
@@ -1057,17 +1368,77 @@ BarWidget {
           }
         }
       }
-    }
 
-    Item {
-      id: searchKeys
-      width: 0
-      height: 0
-      focus: root.popupOpen
-      Keys.priority: Keys.BeforeItem
-      Keys.onPressed: function(event) {
-        root.handleSearchKey(event)
-        if (event.accepted) searchResetTimer.restart()
+      Text {
+        y: stationList.y
+        width: parent.width
+        visible: !root.loadingStations && (root.showHistory ? root.recentTracks.length === 0 : root.stationRows.length === 0)
+        textFormat: Text.PlainText
+        text: strings.t(root.showHistory ? "popup.historyEmpty" : "popup.noMatches")
+        color: Qt.darker(root.bar.foreground, 1.35)
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        wrapMode: Text.WordWrap
+      }
+
+      ListView {
+        id: historyList
+        y: stationList.y
+        width: parent.width
+        height: stationList.height
+        visible: root.showHistory
+        clip: true
+        spacing: Style.space(3)
+        model: root.recentTracks
+        boundsBehavior: Flickable.StopAtBounds
+
+        delegate: Rectangle {
+          required property var modelData
+          width: historyList.width
+          height: Style.space(66)
+          color: Qt.alpha(root.bar.foreground, 0.035)
+          radius: Style.spacing.labelGap
+
+          Column {
+            anchors.fill: parent
+            anchors.margins: Style.space(8)
+            spacing: Style.space(3)
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: modelData.title + (modelData.artist ? " — " + modelData.artist : "")
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              elide: Text.ElideRight
+            }
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: modelData.station + " · " + new Date(modelData.playedAt).toLocaleTimeString(Qt.locale(), Locale.ShortFormat)
+              color: Qt.darker(root.bar.foreground, 1.35)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              text: strings.t("popup.historyCopy")
+              color: Qt.darker(root.bar.foreground, 1.35)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.copyTrack(modelData)
+          }
+        }
       }
     }
   }
