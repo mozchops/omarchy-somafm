@@ -10,6 +10,7 @@ BarWidget {
   moduleName: "nick.somafm"
 
   property bool popupOpen: false
+  property bool settingsOpen: false
   property bool loadingStations: false
   property string catalogError: ""
   property string catalogWarning: ""
@@ -33,13 +34,7 @@ BarWidget {
   property bool stationConfigLoaded: false
   property var savedFavoriteStations: []
   property var translationStrings: ({})
-  property var peakBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-  property var palettes: ({
-    "Spectrum": ["#ff5f6d", "#ff8a5b", "#ffc857", "#e6f14a", "#8de969", "#48d597", "#28c5c9", "#42a5f5", "#7d83ff", "#ae72ef", "#e06bd7", "#ff6f91"],
-    "Aurora": ["#62e6c8", "#56d8d3", "#52c2e8", "#5eacf2", "#788ef2", "#9b7cf1", "#bd79e7", "#d777d0", "#e47fba", "#e894a8", "#efb69e", "#f2d49a"],
-    "Monochrome": ["#f2f2f2", "#e5e5e5", "#d8d8d8", "#cbcbcb", "#bebebe", "#b1b1b1", "#a4a4a4", "#979797", "#8a8a8a", "#7d7d7d", "#707070", "#636363"]
-  })
-  readonly property var paletteNames: ["Spectrum", "Aurora", "Monochrome"]
+  property real outputLevel: 0
   readonly property bool opened: popupOpen
   readonly property string label: currentStation
     ? currentStation.title
@@ -47,8 +42,8 @@ BarWidget {
   readonly property string trackLabel: trackTitle
     ? trackTitle + (trackArtist ? " — " + trackArtist : "")
     : ""
+  readonly property bool trackShown: persisted.showTrack && trackLabel !== ""
   readonly property bool isPlaying: playbackState === "playing"
-  readonly property bool visualizerActive: persisted.visualizerEnabled && isPlaying
   readonly property string statusLabel: {
     if (playbackState === "failed") return strings.t("popup.failed")
     if (playbackState === "buffering") return strings.t("popup.buffering")
@@ -304,6 +299,7 @@ BarWidget {
       if (config.favoriteSort === "name" || config.favoriteSort === "time")
         persisted.favoriteSort = config.favoriteSort
       if (typeof config.autoPlay === "boolean") persisted.autoPlay = config.autoPlay
+      if (typeof config.showTrack === "boolean") persisted.showTrack = config.showTrack
       recentTracks = Array.isArray(config.recentTracks)
         ? config.recentTracks.slice(0, 30).filter(function(track) {
           return track && typeof track.title === "string" && track.title.length <= 160
@@ -335,6 +331,7 @@ BarWidget {
       playTimes: persisted.playTimes || ({}),
       lastStation: currentStation,
       autoPlay: persisted.autoPlay,
+      showTrack: persisted.showTrack,
       recentTracks: recentTracks
     }, null, 2) + "\n")
   }
@@ -407,13 +404,12 @@ BarWidget {
   PersistentProperties {
     id: persisted
     reloadableId: "nick.somafm"
-    property bool visualizerEnabled: true
-    property string paletteName: "Spectrum"
     property var favoriteIds: []
     property var playTimes: ({})
     property string favoriteSort: "name"
     property real playbackVolume: 1.0
     property bool autoPlay: false
+    property bool showTrack: true
 
     onFavoriteIdsChanged: root.rebuildStationRows()
     onPlayTimesChanged: root.rebuildStationRows()
@@ -524,8 +520,7 @@ BarWidget {
   function sendPlayerCommand(action, extra) {
     if (!playerProcess.running) return
     var message = { action: action }
-    if (action === "visualizer") message.enabled = extra
-    else if (action === "volume") message.volume = extra
+    if (action === "volume") message.volume = extra
     playerProcess.write(JSON.stringify(message) + "\n")
   }
 
@@ -575,10 +570,8 @@ BarWidget {
         trackTitle = String(message.title || "").slice(0, 160)
         trackArtist = String(message.artist || "").slice(0, 120)
         if (isPlaying) rememberTrack()
-      } else if (message.type === "peak" && message.bands instanceof Array) {
-        peakBands = message.bands.slice(0, 12).map(function(value) {
-          return Math.max(0, Math.min(1, Number(value) || 0))
-        })
+      } else if (message.type === "level") {
+        outputLevel = Math.max(0, Math.min(1, Number(message.level) || 0))
       } else if (message.type === "error") {
         recordPlayTime()
         playbackSegmentStartedAt = 0
@@ -593,39 +586,44 @@ BarWidget {
     }
   }
 
-  function paletteColor(index) {
-    var palette = palettes[persisted.paletteName] || palettes.Spectrum
-    return palette[index % palette.length]
-  }
-
-  function cyclePalette() {
-    var index = paletteNames.indexOf(persisted.paletteName)
-    persisted.paletteName = paletteNames[(index + 1) % paletteNames.length]
+  Rectangle {
+    anchors.centerIn: parent
+    width: contentRow.width + Style.space(10)
+    height: root.barSize * 0.7
+    color: "transparent"
+    border.width: 1
+    border.color: Qt.alpha(root.bar ? root.bar.barForeground : "white", 0.35)
+    radius: Style.space(4)
   }
 
   Row {
     id: contentRow
     anchors.centerIn: parent
     spacing: Style.space(6)
-    property real stationWidth: Math.min(stationText.implicitWidth, Style.space(100))
-    property real trackAvailableWidth: Math.max(
-      0, Style.space(360) - stationWidth
-        - (visualizer.visible ? visualizer.implicitWidth : 0) - Style.space(18)
-    )
+    property real stationWidth: stationText.implicitWidth
+    property real trackAvailableWidth: Style.space(110)
     property real trackWidth: Math.min(trackText.implicitWidth, trackAvailableWidth)
 
-    Text {
-      textFormat: Text.PlainText
-      text: root.isPlaying ? "󰝚" : "󰓃"
-      color: root.bar ? root.bar.barForeground : "white"
-      font.family: root.bar ? root.bar.fontFamily : "monospace"
-      font.pixelSize: Style.font.body
+    Item {
+      id: meter
+      width: Style.space(4)
+      height: root.barSize
       anchors.verticalCenter: parent.verticalCenter
+
+      Rectangle {
+        width: parent.width
+        height: Math.max(Style.space(2), root.barSize * 0.45 * (root.isPlaying ? root.outputLevel : 0))
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: root.barSize * 0.3
+        radius: Style.space(2)
+        color: root.bar ? root.bar.barForeground : "white"
+        Behavior on height { NumberAnimation { duration: 80 } }
+      }
     }
 
     Item {
       width: contentRow.stationWidth
-        + (root.trackLabel ? Style.space(6) + contentRow.trackWidth : 0)
+        + (root.trackShown ? Style.space(6) + contentRow.trackWidth : 0)
       height: root.barSize
       clip: true
       anchors.verticalCenter: parent.verticalCenter
@@ -640,7 +638,7 @@ BarWidget {
         Text {
           id: stationText
           textFormat: Text.PlainText
-          text: root.label
+          text: root.label + (root.trackShown ? " -" : "")
           color: root.bar ? root.bar.barForeground : "white"
           font.family: root.bar ? root.bar.fontFamily : "monospace"
           font.pixelSize: Style.font.bodySmall
@@ -651,11 +649,11 @@ BarWidget {
 
         Item {
           id: trackClip
-          width: root.trackLabel ? contentRow.trackWidth : 0
+          width: root.trackShown ? contentRow.trackWidth : 0
           height: root.barSize
           clip: true
           anchors.verticalCenter: parent.verticalCenter
-          visible: root.trackLabel !== ""
+          visible: root.trackShown
 
           Text {
             id: trackText
@@ -668,50 +666,27 @@ BarWidget {
             elide: Text.ElideNone
             anchors.verticalCenter: parent.verticalCenter
 
-            NumberAnimation on x {
+            readonly property real overflow: implicitWidth - trackClip.width
+
+            SequentialAnimation on x {
               id: trackScroll
-              running: trackText.implicitWidth > trackClip.width && root.isPlaying
+              running: root.trackShown && trackText.overflow > 0 && root.isPlaying
                 && root.visible && !root.bar.barHidden && !root.popupOpen && !root.bar.vertical
-              onRunningChanged: if (!running) trackText.x = 0
               loops: Animation.Infinite
-              from: trackClip.width
-              to: -trackText.implicitWidth
-              duration: Math.max(10000, (trackText.implicitWidth + trackClip.width) * 45)
-              easing.type: Easing.Linear
+              onRunningChanged: if (!running) trackText.x = 0
+
+              PropertyAction { value: 0 }
+              PauseAnimation { duration: 2000 }
+              NumberAnimation {
+                to: -trackText.overflow
+                duration: Math.max(3000, trackText.overflow * 60)
+                easing.type: Easing.Linear
+              }
+              PauseAnimation { duration: 1500 }
             }
           }
         }
       }
-    }
-
-    Item {
-      id: visualizer
-      visible: root.visualizerActive || root.popupOpen
-      implicitWidth: peakColumns.implicitWidth
-      width: visible ? implicitWidth : 0
-      height: root.barSize
-      anchors.verticalCenter: parent.verticalCenter
-
-      Row {
-        id: peakColumns
-        anchors.verticalCenter: parent.verticalCenter
-        spacing: Style.space(2)
-        opacity: root.visualizerActive
-
-        Repeater {
-          model: 12
-
-          Rectangle {
-            required property int index
-            width: Style.space(3)
-            height: Math.max(Style.space(2), root.barSize * (root.peakBands[index] || 0) * 0.55)
-            anchors.verticalCenter: parent.verticalCenter
-            radius: Style.space(2)
-            color: root.paletteColor(index)
-          }
-        }
-      }
-
     }
   }
 
@@ -721,15 +696,7 @@ BarWidget {
     cursorShape: Qt.PointingHandCursor
     onClicked: function(mouse) {
       if (mouse.button === Qt.RightButton) root.togglePlayback()
-      else {
-        var visualizerOrigin = visualizer.mapToItem(root, 0, 0)
-        if (root.visualizerActive
-            && mouse.x >= visualizerOrigin.x && mouse.x <= visualizerOrigin.x + visualizer.width
-            && mouse.y >= visualizerOrigin.y && mouse.y <= visualizerOrigin.y + visualizer.height)
-          root.cyclePalette()
-        else
-          root.toggleSelector()
-      }
+      else root.toggleSelector()
     }
   }
 
@@ -774,7 +741,6 @@ BarWidget {
     stderr: StdioCollector { waitForEnd: true }
     onStarted: {
       root.sendPlayerCommand("volume", persisted.playbackVolume)
-      root.sendPlayerCommand("visualizer", persisted.visualizerEnabled)
     }
     onExited: {
       if (root.pendingStation) root.launchPendingStation()
@@ -813,7 +779,7 @@ BarWidget {
     open: root.popupOpen
     focusTarget: searchField
     centerOnBar: false
-    contentWidth: popup.fittedContentWidth(Style.space(420))
+    contentWidth: popup.fittedContentWidth(Style.space(380))
     contentHeight: popup.fittedContentHeight(Style.space(900))
 
     Item {
@@ -832,11 +798,11 @@ BarWidget {
         Column {
           id: panelControls
           width: parent.width
-          spacing: Style.space(8)
+          spacing: Style.space(6)
 
-          Column {
+          Row {
             width: parent.width
-            spacing: Style.space(2)
+            spacing: Style.space(8)
 
             Text {
               textFormat: Text.PlainText
@@ -845,55 +811,24 @@ BarWidget {
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.subtitle
               font.bold: true
-            }
-
-            Text {
-              width: parent.width
-              textFormat: Text.PlainText
-              text: strings.t("popup.validateSubtitle")
-              color: Qt.darker(root.bar.foreground, 1.35)
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-          }
-
-          Row {
-            width: parent.width
-            spacing: Style.space(8)
-
-            Button {
-              width: (parent.width - Style.space(8)) / 2
-              text: strings.t("popup.validateStreams")
-              foreground: root.bar.foreground
-              bordered: true
-              enabled: !root.loadingStations
-              opacity: enabled ? 1.0 : 0.55
-              onClicked: root.validateStreams()
+              anchors.verticalCenter: parent.verticalCenter
+              width: parent.width - settingsButton.width - Style.space(8)
+              elide: Text.ElideRight
             }
 
             Button {
-              width: (parent.width - Style.space(8)) / 2
-              text: strings.t("popup.sortFavourites").arg(
-                strings.t(persisted.favoriteSort === "time" ? "popup.sortTime" : "popup.sortName")
-              )
+              id: settingsButton
+              width: Style.space(150)
+              text: strings.t(root.settingsOpen ? "popup.settingsHide" : "popup.settingsShow")
               foreground: root.bar.foreground
               bordered: true
-              onClicked: root.toggleFavoriteSort()
+              onClicked: root.settingsOpen = !root.settingsOpen
             }
-          }
-
-          Button {
-            width: parent.width
-            text: strings.t("popup.resetListeningTimes")
-            foreground: root.bar.foreground
-            bordered: true
-            onClicked: root.resetListeningTimes()
           }
 
           Rectangle {
             width: parent.width
-            height: Style.space(76)
+            height: Style.space(66)
             radius: Style.spacing.labelGap
             color: Qt.alpha(root.bar.foreground, 0.06)
 
@@ -972,30 +907,6 @@ BarWidget {
             }
           }
 
-          Row {
-            width: parent.width
-            spacing: Style.space(8)
-
-            Button {
-              width: (parent.width - Style.space(8)) / 2
-              text: strings.t(persisted.autoPlay ? "popup.autoPlayOn" : "popup.autoPlayOff")
-              foreground: root.bar.foreground
-              bordered: true
-              onClicked: {
-                persisted.autoPlay = !persisted.autoPlay
-                root.saveStationConfig()
-              }
-            }
-
-            Button {
-              width: (parent.width - Style.space(8)) / 2
-              text: root.sleepLabel
-              foreground: root.bar.foreground
-              bordered: true
-              onClicked: root.cycleSleepTimer()
-            }
-          }
-
           Column {
             width: parent.width
             spacing: Style.space(4)
@@ -1067,49 +978,110 @@ BarWidget {
             }
           }
 
-          Row {
-            id: visualizerSettings
+          Column {
             width: parent.width
-            spacing: Style.space(8)
+            spacing: Style.space(6)
+            visible: root.settingsOpen
 
-            Text {
-              id: visualizerLabel
-              textFormat: Text.PlainText
-              text: strings.t("popup.visualizer")
-              color: root.bar.foreground
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              anchors.verticalCenter: parent.verticalCenter
-              width: parent.width - visualizerToggle.width - Style.space(8)
-            }
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
 
-            Rectangle {
-              id: visualizerToggle
-              width: Style.space(42)
-              height: Style.space(24)
-              radius: Style.space(12)
-              color: persisted.visualizerEnabled ? Commons.Color.accent : Qt.alpha(root.bar.foreground, 0.15)
-              anchors.verticalCenter: parent.verticalCenter
-
-              Rectangle {
-                width: Style.space(18)
-                height: Style.space(18)
-                radius: width / 2
-                y: Style.space(3)
-                x: persisted.visualizerEnabled ? parent.width - width - Style.space(3) : Style.space(3)
-                color: root.bar.background
+              Button {
+                width: (parent.width - Style.space(8)) / 2
+                text: strings.t("popup.validateStreams")
+                foreground: root.bar.foreground
+                bordered: true
+                enabled: !root.loadingStations
+                opacity: enabled ? 1.0 : 0.55
+                onClicked: root.validateStreams()
               }
 
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
+              Button {
+                width: (parent.width - Style.space(8)) / 2
+                text: strings.t("popup.sortFavourites").arg(
+                  strings.t(persisted.favoriteSort === "time" ? "popup.sortTime" : "popup.sortName")
+                )
+                foreground: root.bar.foreground
+                bordered: true
+                onClicked: root.toggleFavoriteSort()
+              }
+            }
+
+            Button {
+              width: parent.width
+              text: strings.t("popup.resetListeningTimes")
+              foreground: root.bar.foreground
+              bordered: true
+              onClicked: root.resetListeningTimes()
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+
+              Button {
+                width: (parent.width - Style.space(8)) / 2
+                text: strings.t(persisted.autoPlay ? "popup.autoPlayOn" : "popup.autoPlayOff")
+                foreground: root.bar.foreground
+                bordered: true
                 onClicked: {
-                  persisted.visualizerEnabled = !persisted.visualizerEnabled
-                  root.sendPlayerCommand("visualizer", persisted.visualizerEnabled)
+                  persisted.autoPlay = !persisted.autoPlay
+                  root.saveStationConfig()
+                }
+              }
+
+              Button {
+                width: (parent.width - Style.space(8)) / 2
+                text: root.sleepLabel
+                foreground: root.bar.foreground
+                bordered: true
+                onClicked: root.cycleSleepTimer()
+              }
+            }
+
+
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+
+              Text {
+                textFormat: Text.PlainText
+                text: strings.t("popup.showTrack")
+                color: root.bar.foreground
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                anchors.verticalCenter: parent.verticalCenter
+                width: parent.width - scrollToggle.width - Style.space(8)
+              }
+
+              Rectangle {
+                id: scrollToggle
+                width: Style.space(42)
+                height: Style.space(24)
+                radius: Style.space(12)
+                color: persisted.showTrack ? Commons.Color.accent : Qt.alpha(root.bar.foreground, 0.15)
+                anchors.verticalCenter: parent.verticalCenter
+
+                Rectangle {
+                  width: Style.space(18)
+                  height: Style.space(18)
+                  radius: width / 2
+                  y: Style.space(3)
+                  x: persisted.showTrack ? parent.width - width - Style.space(3) : Style.space(3)
+                  color: root.bar.background
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                  persisted.showTrack = !persisted.showTrack
+                  root.saveStationConfig()
+                }
                 }
               }
             }
-
           }
 
           Rectangle {

@@ -1,6 +1,6 @@
 # SomaFM widget
 
-![SomaFM bar widget and station selector with sample song information](preview.png)
+![SomaFM bar widget and the station popup with advanced settings open](preview.png)
 
 [SomaFM](https://somafm.com/) offers a free streaming radio service. If you enjoy
 listening, please consider [supporting SomaFM](https://somafm.com/support/) to help
@@ -47,11 +47,22 @@ states; after failure, click **Play** to retry.
 Select a station to play it; right-click
 the bar widget to pause or resume. Desktop media keys and MPRIS-compatible
 controllers can also play, pause, stop, and adjust this widget's volume.
-The popup contains the peak-visualizer
-toggle, you can change the colour palette of the visualiser by clicking on it, 
-There is also an independent SomaFM stream-volume slider.
-The slider affects only this widget's audio, not system volume. The popup
-opens below the bar widget.
+The bar widget is a compact outlined box: a single-column level meter, the
+station name, and (when a track is known) ` - ` followed by the track name. The
+meter shows the stream's output level, measured before any volume setting is
+applied, so system volume and the SomaFM slider don't affect it. The station name
+is always shown in full; the track field has a fixed maximum width and shrinks
+to fit short titles. When a title is too long it appears from its start, pauses,
+scrolls slowly to the end, pauses again, then jumps back and repeats.
+
+The popup keeps the everyday controls on top: the now-playing card, **Pause**,
+**Stop**, **Copy song**, an independent SomaFM stream-volume slider (it affects
+only this widget's audio, not system volume), the **Stations** and **History**
+tabs, search, and the station list. Click **Advanced settings** to reveal
+**Validate streams**, the favourites sort, **Reset listening times**,
+**Startup playback**, the **Sleep timer**, and the **Show track name** switch.
+Turning off **Show track name** hides the track and shrinks the bar widget to
+just the meter and station. The popup opens below the bar widget.
 Right-click a station to toggle its favorite status. Favorites appear
 first; the sort button switches between
 alphabetical and most-played order, based on accumulated listening time.
@@ -76,19 +87,19 @@ Validated station catalog and favorite station records are saved in
 and **Validate streams** refreshes it. Favorite IDs are retained across refreshes, 
 with matching favorites updated to the newest stream details.
 The same file stores song history, the last station, and the startup-playback
-choice. The sleep timer is session-only.
+and show-track-name choices. The sleep timer is session-only.
 Each station uses its official SomaFM artwork thumbnail in the selector; the
 bar displays the station name without artwork.
 
 FFmpeg decodes
-the selected stream to PCM for PipeWire playback and calculates the live
-visualizer levels. While a station is playing, the helper requests that
+the selected stream to PCM for PipeWire playback and the helper calculates the
+live output level. While a station is playing, the helper requests that
 station's current-song JSON every 20 seconds. It does not refresh the catalog
 in the background.
 
 Network requests use fixed HTTPS SomaFM endpoints with bounded response sizes
-and timeouts. Unverified playlist entries are omitted. Visualizer, palette,
-and stream-volume preferences are kept in Quickshell persistent properties.
+and timeouts. Unverified playlist entries are omitted. The stream-volume
+preference is kept in Quickshell persistent properties.
 
 ## Development checks
 

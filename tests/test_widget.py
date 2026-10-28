@@ -37,7 +37,7 @@ class WidgetTests(unittest.TestCase):
                 "for line in sys.stdin:\n"
                 " command = json.loads(line)\n"
                 " action = command['action']\n"
-                " if action == 'visualizer':\n"
+                " if action == 'volume':\n"
                 "  emit({'type':'state','state':'playing'})\n"
                 "  emit({'type':'track','title':'Example song','artist':'Example artist'})\n"
                 " elif action in ('pause', 'resume'):\n"

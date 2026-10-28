@@ -18,6 +18,14 @@ BACKUP = "https://ice2.somafm.com/groovesalad-128-mp3"
 
 
 class StreamTests(unittest.TestCase):
+    def test_level_is_normalised_and_silence_is_zero(self):
+        import array
+        loud = array.array("h", [16000, -16000] * 512).tobytes()
+        quiet = array.array("h", [400, -400] * 512).tobytes()
+        self.assertEqual(somafm.level(bytes(2048)), 0.0)
+        self.assertGreater(somafm.level(loud), somafm.level(quiet))
+        self.assertLessEqual(somafm.level(array.array("h", [32767, -32768] * 512).tobytes()), 1.0)
+
     def test_catalog_keeps_verified_backup_servers_in_bitrate_order(self):
         channel = {
             "id": "groovesalad", "title": "Groove Salad",
@@ -96,7 +104,7 @@ class StreamTests(unittest.TestCase):
             nonlocal playing
             state = message.get("state")
             if state == "buffering":
-                return [{"action": "volume", "volume": 0}, {"action": "visualizer", "enabled": False}]
+                return [{"action": "volume", "volume": 0}]
             if state == "playing":
                 playing += 1
                 return [{"action": "pause" if playing == 1 else "stop"}]

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import array
-import cmath
 import json
 import math
 import os
@@ -25,7 +24,6 @@ API_HOST = "api.somafm.com"
 ICE_HOST = re.compile(r"ice[0-9]+\.somafm\.com\Z")
 CHANNEL_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,47}\Z")
 SAMPLE_RATE = 44100
-FFT_SIZE = 1024
 MAX_CHANNELS = 120
 MAX_CATALOG_BYTES = 512 * 1024
 MAX_PLAYLIST_BYTES = 32 * 1024
@@ -245,55 +243,16 @@ def metadata_worker(channel_id: str, stopped: threading.Event) -> None:
         stopped.wait(20)
 
 
-def fft(samples: list[float]) -> list[complex]:
-    size = len(samples)
-    values = [
-        complex(samples[index] * (0.5 - 0.5 * math.cos(2 * math.pi * index / (size - 1))), 0)
-        for index in range(size)
-    ]
-    j = 0
-    for i in range(1, size):
-        bit = size >> 1
-        while j & bit:
-            j ^= bit
-            bit >>= 1
-        j ^= bit
-        if i < j:
-            values[i], values[j] = values[j], values[i]
-    length = 2
-    while length <= size:
-        root = cmath.exp(-2j * math.pi / length)
-        for start in range(0, size, length):
-            factor = 1 + 0j
-            half = length >> 1
-            for offset in range(half):
-                even = values[start + offset]
-                odd = factor * values[start + offset + half]
-                values[start + offset] = even + odd
-                values[start + offset + half] = even - odd
-                factor *= root
-        length <<= 1
-    return values
-
-
-def spectrum(pcm: bytes) -> list[float]:
+def level(pcm: bytes) -> float:
     samples = array.array("h")
-    samples.frombytes(pcm)
+    samples.frombytes(pcm[:len(pcm) - len(pcm) % 2])
     if sys.byteorder != "little":
         samples.byteswap()
-    mono = [(samples[index] + samples[index + 1]) / 65536.0 for index in range(0, len(samples), 2)]
-    if len(mono) < FFT_SIZE:
-        return [0.0] * 12
-    values = fft(mono[:FFT_SIZE])
-    frequencies = [abs(value) / FFT_SIZE for value in values[:FFT_SIZE // 2]]
-    bands: list[float] = []
-    for band in range(12):
-        low = max(1, int(1.5 * (20000 / 1.5) ** (band / 12)))
-        high = max(low + 1, int(1.5 * (20000 / 1.5) ** ((band + 1) / 12)))
-        peak = max(frequencies[low:min(high, len(frequencies))] or [0.0])
-        decibels = 20 * math.log10(max(peak, 1e-6))
-        bands.append(max(0.0, min(1.0, (decibels + 62) / 52)))
-    return bands
+    if not samples:
+        return 0.0
+    rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples)) / 32768.0
+    decibels = 20 * math.log10(max(rms, 1e-6))
+    return max(0.0, min(1.0, (decibels + 45) / 37))
 
 
 def apply_volume(pcm: bytes, volume: float) -> bytes:
@@ -374,12 +333,10 @@ def play_stream(url: str, channel_id: str, alternatives: object = None) -> int:
         selector.register(sys.stdin, selectors.EVENT_READ, "command")
         input_buffer = ""
         paused = False
-        visualizer_enabled = True
         volume = 1.0
         volume_remainder = b""
         last_audio = time.monotonic()
         last_peak = 0.0
-        pending_pcm = bytearray()
         retry_at = 0.0
         failures = 0
         playing_since = 0.0
@@ -400,14 +357,13 @@ def play_stream(url: str, channel_id: str, alternatives: object = None) -> int:
             failures += 1
             playing_since = 0.0
             announced_playing = False
-            pending_pcm.clear()
             volume_remainder = b""
             if failures > 6:
                 emit({"type": "error", "message": reason})
                 return False
             retry_at = time.monotonic() + min(2 ** (failures - 1), 8)
             emit({"type": "state", "state": "reconnecting", "attempt": failures})
-            emit({"type": "peak", "bands": [0] * 12})
+            emit({"type": "level", "level": 0})
             return True
 
         while not STOP:
@@ -461,10 +417,6 @@ def play_stream(url: str, channel_id: str, alternatives: object = None) -> int:
                                 emit({"type": "state", "state": "buffering" if ffmpeg else "reconnecting"})
                         elif action == "stop":
                             STOP = True
-                        elif action == "visualizer":
-                            visualizer_enabled = command.get("enabled") is True
-                            if not visualizer_enabled:
-                                emit({"type": "peak", "bands": [0] * 12})
                         elif action == "volume":
                             value = command.get("volume")
                             if isinstance(value, (int, float)) and math.isfinite(value):
@@ -481,6 +433,9 @@ def play_stream(url: str, channel_id: str, alternatives: object = None) -> int:
                         chunk = chunk[:-1]
                     else:
                         volume_remainder = b""
+                    if time.monotonic() - last_peak >= 0.08:
+                        emit({"type": "level", "level": round(level(chunk), 3)})
+                        last_peak = time.monotonic()
                     chunk = apply_volume(chunk, volume)
                     remaining = memoryview(chunk)
                     while remaining:
@@ -492,14 +447,7 @@ def play_stream(url: str, channel_id: str, alternatives: object = None) -> int:
                         announced_playing = True
                         playing_since = time.monotonic()
                         emit({"type": "state", "state": "playing"})
-                    pending_pcm.extend(chunk)
                     last_audio = time.monotonic()
-                    if len(pending_pcm) >= FFT_SIZE * 4:
-                        block = bytes(pending_pcm[:FFT_SIZE * 4])
-                        del pending_pcm[:FFT_SIZE * 4]
-                        if visualizer_enabled and time.monotonic() - last_peak >= 0.08:
-                            emit({"type": "peak", "bands": spectrum(block)})
-                            last_peak = time.monotonic()
             if not paused and ffmpeg and time.monotonic() - last_audio > 20:
                 if not reconnect("Audio stream timed out after repeated reconnect attempts"):
                     return 1
